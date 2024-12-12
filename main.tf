@@ -1,105 +1,133 @@
 # Configure the AWS Provider
+variable "aws_access_key" {
+  description = "AWS access key"
+  type        = string
+  sensitive   = true
+}
+
+variable "aws_secret_key" {
+  description = "AWS secret key"
+  type        = string
+  sensitive   = true
+}
+
+variable "aws_session_token" {
+  description = "AWS session token (for temporary credentials)"
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+# Configure AWS Provider with declared variables
 provider "aws" {
-  region = "us-west-2"  # Replace with your desired region
+  region     = "us-west-2"
+  access_key = var.aws_access_key
+  secret_key = var.aws_secret_key
+  token      = var.aws_session_token
 }
 
-# Create a VPC
-resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
-  
-  tags = {
-    Name = "Main VPC"
-  }
-}
-
-# Create a subnet within the VPC
-resource "aws_subnet" "main" {
-  vpc_id     = aws_vpc.main.id
-  cidr_block = "10.0.1.0/24"
-  
-  tags = {
-    Name = "Main Subnet"
+data "aws_availability_zones" "available" {
+  # Exclude local zones
+  filter {
+    name   = "opt-in-status"
+    values = ["opt-in-not-required"]
   }
 }
 
-# Create a security group
-resource "aws_security_group" "allow_ssh" {
-  name        = "allow_ssh"
-  description = "Allow SSH inbound traffic"
-  vpc_id      = aws_vpc.main.id
+locals {
+  name   = "terrakube"
+  region = "us-west-2"
 
-  ingress {
-    description = "SSH from VPC"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]  # Be cautious with this in production
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  vpc_cidr = "10.0.0.0/16"
+  azs      = slice(data.aws_availability_zones.available.names, 0, 3)
 
   tags = {
-    Name = "Allow SSH"
+    cluster_name    = local.name
+    For = "testing-purpose"
+    by  = "terrakube/akshat"
   }
 }
 
-# Create an EC2 instance
-resource "aws_instance" "web" {
-  ami           = "ami-0c55b159cbfafe1f0"  # Amazon Linux 2 AMI (update with latest AMI)
-  instance_type = "t2.micro"
-  subnet_id     = aws_subnet.main.id
-  
-  vpc_security_group_ids = [aws_security_group.allow_ssh.id]
+################################################################################
+# VPC
+################################################################################
 
-  # Optional: Add a key pair for SSH access
-  key_name = "your-key-pair-name"  # Replace with your existing key pair
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
 
-  # Optional: Add user data for initial setup
-  user_data = <<-EOF
-              #!/bin/bash
-              yum update -y
-              yum install -y httpd
-              systemctl start httpd
-              systemctl enable httpd
-              EOF
+  name = local.name
+  cidr = local.vpc_cidr
 
-  # Optional: Add tags for better resource management
-  tags = {
-    Name        = "WebServer"
-    Environment = "Development"
-    Terraform   = "true"
+  azs             = local.azs
+  private_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 4, k)]
+  public_subnets  = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 48)]
+
+  enable_nat_gateway = false
+  single_nat_gateway = false
+
+  public_subnet_tags = {
+    "kubernetes.io/role/elb" = 1
   }
 
-  # Optional: Root volume configuration
-  root_block_device {
-    volume_type           = "gp3"
-    volume_size           = 30
-    delete_on_termination = true
+  private_subnet_tags = {
+    "kubernetes.io/role/internal-elb" = 1
   }
+
+  tags = local.tags
 }
 
-# Optional: Create an Elastic IP
-resource "aws_eip" "web_eip" {
-  instance = aws_instance.web.id
-  vpc      = true
 
-  tags = {
-    Name = "WebServer EIP"
+module "eks_al2023" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"
+
+  cluster_name    = "${local.name}-al2023"
+  cluster_version = "1.31"
+
+  # EKS Addons
+  cluster_addons = {
+    kube-proxy             = {}
+    vpc-cni                = {}
   }
-}
 
-# Outputs
-output "instance_id" {
-  description = "ID of the EC2 instance"
-  value       = aws_instance.web.id
-}
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.public_subnets
 
-output "instance_public_ip" {
-  description = "Public IP of the EC2 instance"
-  value       = aws_eip.web_eip.public_ip
+  self_managed_node_groups = {
+    terrakube-ng = {
+      ami_type      = "AL2023_x86_64_STANDARD"
+      instance_type = "t3.small"
+
+      min_size = 1
+      max_size = 1
+      # This value is ignored after the initial creation
+      # https://github.com/bryantbiggs/eks-desired-size-hack
+      desired_size = 1
+
+
+      cluster_log_types = []
+
+      # This is not required - demonstrates how to pass additional configuration to nodeadm
+      # Ref https://awslabs.github.io/amazon-eks-ami/nodeadm/doc/api/
+      cloudinit_pre_nodeadm = [
+        {
+          content_type = "application/node.eks.aws"
+          content      = <<-EOT
+            ---
+            apiVersion: node.eks.aws/v1alpha1
+            kind: NodeConfig
+            spec:
+              kubelet:
+                config:
+                  shutdownGracePeriod: 30s
+                  featureGates:
+                    DisableKubeletCloudCredentialProviders: true
+          EOT
+        }
+      ]
+    }
+  }
+
+  tags = local.tags
 }
